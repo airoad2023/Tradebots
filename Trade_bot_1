@@ -1,0 +1,905 @@
+"""
+PumpPortal Paper Trade Bot - $10k / 5m Strategy Test
+====================================================
+
+Strategy being tested:
+- Watch new PumpPortal launches.
+- At exactly 5:00 minutes, consider only coins above $10,000 market cap.
+- Paper-buy €1 at the 5-minute market cap if filters pass.
+- Between 5:15 and 6:30, the coin must show confirmation movement.
+- Take profit at +15% by default.
+- Stop loss at -15%.
+- Avoid:
+    1. top buyer share too high
+    2. creator sold and buyers did not absorb it
+    3. no movement after 5 minutes
+    4. drop -15% before profit
+
+Important:
+- This script does NOT place real trades.
+- It only paper-trades and saves results into MySQL.
+- It stops after 5 paper trades are closed, or after the run window is finished.
+"""
+
+import asyncio
+import json
+import time
+from dataclasses import dataclass, field
+from datetime import datetime
+from typing import Any, Dict, List, Optional, Set
+
+import mysql.connector
+import websockets
+
+
+# =====================================================
+# CONFIG
+# =====================================================
+
+MYSQL_CONFIG = {
+    "host": "localhost",
+    "user": "root",
+    "password": "9677368753",
+    "port": 3306,
+    "database": "pump_portal_1",
+}
+
+PUMPPORTAL_API_KEY = "c94k6wb58d372j9fatqmmpjc6d574rup6rr4cckq8mr52wthet136gjtcnb32d315duk0kv389970rk1dt8n2gbp9hr6mwbb6x9mahju85v78k3ed9546ta8chw50y9b6da5jvbda4ykudhp4pkkfe1c4pthnad7q6j3heg8t448k3g95q70pkcexb68vkd6nr78gkg6xvkuf8"
+PUMPPORTAL_URL = f"wss://pumpportal.fun/api/data?api-key={PUMPPORTAL_API_KEY}"
+
+SOL_USD_PRICE_MANUAL = 180.0
+RUN_ID = datetime.now().strftime("paper_trade_10k_%Y_%m_%d_%H_%M_%S")
+
+# Main run settings
+LAUNCH_COLLECTION_SECONDS = 3600
+MAX_TOTAL_TRACKED_TOKENS = 300
+MAX_ACTIVE_TRACKED_TOKENS = 80
+
+# Paper trading settings
+MAX_PAPER_TRADES = 5
+PAPER_INVESTMENT_EUR = 1.00
+
+# Entry
+ENTRY_SECONDS = 300
+ENTRY_MARKET_CAP_USD = 10_000
+
+# Confirmation
+CONFIRMATION_START_SECONDS = 315   # 5:15
+CONFIRMATION_END_SECONDS = 390     # 6:30
+MIN_CONFIRMATION_RETURN_PERCENT = 8.0
+
+# Exit
+TAKE_PROFIT_PERCENT = 15.0
+STOP_LOSS_PERCENT = -15.0
+FORCE_EXIT_SECONDS = 600           # 10:00
+
+# Avoid / risk filters at 5m entry
+MAX_TOP_BUYER_SHARE_PERCENT = 80.0
+WARNING_TOP_BUYER_SHARE_PERCENT = 50.0
+
+# Snapshot windows for decision-making
+DECISION_WINDOWS = [
+    300,
+    315, 330, 345,
+    360, 375, 390,
+    405, 420, 435, 450, 465,
+    480, 495, 510, 525,
+    540, 555, 570, 585,
+    600
+]
+
+
+# =====================================================
+# MYSQL
+# =====================================================
+
+mydb = mysql.connector.connect(**MYSQL_CONFIG)
+cursor = mydb.cursor(dictionary=True)
+
+
+def ensure_tables():
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS pump_paper_trade_results (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+
+        run_id VARCHAR(120) NOT NULL,
+        mint VARCHAR(255) NOT NULL,
+        token_name VARCHAR(255),
+        symbol VARCHAR(100),
+        creator_wallet VARCHAR(255),
+
+        launch_time DATETIME,
+        entry_time DATETIME,
+        close_time DATETIME,
+
+        entry_seconds INT,
+        close_seconds INT,
+
+        investment_eur DECIMAL(20,8),
+        entry_market_cap_sol DECIMAL(40,10),
+        entry_market_cap_usd DECIMAL(40,10),
+        close_market_cap_sol DECIMAL(40,10),
+        close_market_cap_usd DECIMAL(40,10),
+
+        return_percent DECIMAL(20,8),
+        profit_eur DECIMAL(20,8),
+
+        close_reason VARCHAR(100),
+        trade_status VARCHAR(50),
+
+        entry_buy_count INT,
+        entry_sell_count INT,
+        entry_unique_buyers INT,
+        entry_unique_sellers INT,
+        entry_buy_volume_sol DECIMAL(40,10),
+        entry_sell_volume_sol DECIMAL(40,10),
+        entry_net_volume_sol DECIMAL(40,10),
+        entry_creator_sold BOOLEAN,
+        entry_creator_sell_volume_sol DECIMAL(40,10),
+        entry_top_buyer_share_percent DECIMAL(20,8),
+        entry_risk_note TEXT,
+
+        best_market_cap_usd DECIMAL(40,10),
+        best_return_percent DECIMAL(20,8),
+        best_return_seconds INT,
+
+        worst_market_cap_usd DECIMAL(40,10),
+        worst_return_percent DECIMAL(20,8),
+        worst_return_seconds INT,
+
+        hit_plus_15 BOOLEAN DEFAULT FALSE,
+        hit_plus_20 BOOLEAN DEFAULT FALSE,
+        hit_plus_30 BOOLEAN DEFAULT FALSE,
+        confirmed_move BOOLEAN DEFAULT FALSE,
+        first_confirmation_seconds INT,
+
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+
+        UNIQUE KEY unique_run_mint (run_id, mint),
+        INDEX idx_run_id (run_id),
+        INDEX idx_mint (mint),
+        INDEX idx_creator_wallet (creator_wallet),
+        INDEX idx_close_reason (close_reason),
+        INDEX idx_trade_status (trade_status)
+    )
+    """)
+    mydb.commit()
+
+
+# =====================================================
+# HELPERS
+# =====================================================
+
+def now_dt() -> datetime:
+    return datetime.now()
+
+
+def to_float(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except Exception:
+        return None
+
+
+def clean_text(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    value = str(value).strip()
+    return value if value else None
+
+
+def market_cap_usd(market_cap_sol: Optional[float]) -> Optional[float]:
+    if market_cap_sol is None:
+        return None
+    return float(market_cap_sol) * float(SOL_USD_PRICE_MANUAL)
+
+
+def calc_return_percent(current_mc_sol: Optional[float], entry_mc_sol: Optional[float]) -> Optional[float]:
+    if current_mc_sol is None or entry_mc_sol is None or entry_mc_sol == 0:
+        return None
+    return ((current_mc_sol - entry_mc_sol) / entry_mc_sol) * 100
+
+
+def profit_from_return(return_percent: float) -> float:
+    return PAPER_INVESTMENT_EUR * (return_percent / 100.0)
+
+
+def seconds_label(seconds: int) -> str:
+    return f"{seconds // 60}:{seconds % 60:02d}"
+
+
+# =====================================================
+# DATA MODELS
+# =====================================================
+
+@dataclass
+class TradeEvent:
+    tx_type: str
+    trader: str
+    sol_amount: float
+    market_cap_sol: Optional[float]
+    seconds_after_launch: float
+    signature: Optional[str] = None
+
+
+@dataclass
+class TokenState:
+    mint: str
+    name: Optional[str]
+    symbol: Optional[str]
+    creator_wallet: Optional[str]
+    launch_time: datetime
+    launch_ts: float
+    initial_market_cap_sol: Optional[float]
+
+    trades: List[TradeEvent] = field(default_factory=list)
+
+    is_candidate: bool = False
+    paper_entered: bool = False
+    paper_closed: bool = False
+
+    entry_snapshot: Optional[Dict[str, Any]] = None
+    entry_market_cap_sol: Optional[float] = None
+    entry_market_cap_usd: Optional[float] = None
+    entry_time: Optional[datetime] = None
+
+    confirmed_move: bool = False
+    first_confirmation_seconds: Optional[int] = None
+
+    best_market_cap_usd: Optional[float] = None
+    best_return_percent: Optional[float] = None
+    best_return_seconds: Optional[int] = None
+
+    worst_market_cap_usd: Optional[float] = None
+    worst_return_percent: Optional[float] = None
+    worst_return_seconds: Optional[int] = None
+
+    hit_plus_15: bool = False
+    hit_plus_20: bool = False
+    hit_plus_30: bool = False
+
+
+# =====================================================
+# SNAPSHOT CALCULATION
+# =====================================================
+
+def calculate_snapshot(token: TokenState, window_seconds: int) -> Dict[str, Any]:
+    relevant = [t for t in token.trades if t.seconds_after_launch <= window_seconds]
+
+    buy_trades = [t for t in relevant if t.tx_type == "buy"]
+    sell_trades = [t for t in relevant if t.tx_type == "sell"]
+
+    buy_count = len(buy_trades)
+    sell_count = len(sell_trades)
+
+    unique_buyers = len({t.trader for t in buy_trades if t.trader})
+    unique_sellers = len({t.trader for t in sell_trades if t.trader})
+
+    buy_volume = sum(t.sol_amount for t in buy_trades)
+    sell_volume = sum(t.sol_amount for t in sell_trades)
+    net_volume = buy_volume - sell_volume
+
+    # Current MC = latest MC before this snapshot window.
+    current_market_cap_sol = token.initial_market_cap_sol
+    latest_trade_with_mc = None
+
+    for t in relevant:
+        if t.market_cap_sol is not None:
+            if latest_trade_with_mc is None or t.seconds_after_launch > latest_trade_with_mc.seconds_after_launch:
+                latest_trade_with_mc = t
+
+    if latest_trade_with_mc:
+        current_market_cap_sol = latest_trade_with_mc.market_cap_sol
+
+    creator_sell_count = 0
+    creator_sell_volume = 0.0
+
+    if token.creator_wallet:
+        for t in sell_trades:
+            if t.trader == token.creator_wallet:
+                creator_sell_count += 1
+                creator_sell_volume += t.sol_amount
+
+    creator_sold = creator_sell_count > 0
+
+    # Top buyer share
+    buyer_volume_by_wallet: Dict[str, float] = {}
+    for t in buy_trades:
+        if t.trader:
+            buyer_volume_by_wallet[t.trader] = buyer_volume_by_wallet.get(t.trader, 0.0) + t.sol_amount
+
+    top_buyer_sol = max(buyer_volume_by_wallet.values()) if buyer_volume_by_wallet else 0.0
+    top_buyer_share = (top_buyer_sol / buy_volume * 100) if buy_volume > 0 else None
+
+    buy_volume_gt_sell_volume = buy_volume > sell_volume
+    creator_sell_absorbed = (not creator_sold) or (creator_sold and net_volume > 0 and buy_volume_gt_sell_volume)
+
+    risk_notes = []
+
+    if top_buyer_share is not None and top_buyer_share > MAX_TOP_BUYER_SHARE_PERCENT:
+        risk_notes.append("top_buyer_share_too_high")
+
+    if top_buyer_share is not None and top_buyer_share > WARNING_TOP_BUYER_SHARE_PERCENT:
+        risk_notes.append("top_buyer_share_warning")
+
+    if creator_sold and not creator_sell_absorbed:
+        risk_notes.append("creator_sold_not_absorbed")
+
+    if sell_volume >= buy_volume:
+        risk_notes.append("sell_volume_equal_or_higher")
+
+    if net_volume <= 0:
+        risk_notes.append("net_volume_not_positive")
+
+    return {
+        "window_seconds": window_seconds,
+        "current_market_cap_sol": current_market_cap_sol,
+        "current_market_cap_usd": market_cap_usd(current_market_cap_sol),
+        "buy_count": buy_count,
+        "sell_count": sell_count,
+        "unique_buyers": unique_buyers,
+        "unique_sellers": unique_sellers,
+        "buy_volume_sol": buy_volume,
+        "sell_volume_sol": sell_volume,
+        "net_volume_sol": net_volume,
+        "creator_sold": creator_sold,
+        "creator_sell_volume_sol": creator_sell_volume,
+        "top_buyer_share_percent": top_buyer_share,
+        "creator_sell_absorbed": creator_sell_absorbed,
+        "risk_notes": ", ".join(risk_notes) if risk_notes else "clean",
+    }
+
+
+def passes_entry_filters(snapshot: Dict[str, Any]) -> bool:
+    mc_usd = snapshot["current_market_cap_usd"] or 0
+
+    if mc_usd < ENTRY_MARKET_CAP_USD:
+        return False
+
+    top_buyer_share = snapshot["top_buyer_share_percent"]
+    if top_buyer_share is not None and top_buyer_share > MAX_TOP_BUYER_SHARE_PERCENT:
+        return False
+
+    if snapshot["creator_sold"] and not snapshot["creator_sell_absorbed"]:
+        return False
+
+    return True
+
+
+# =====================================================
+# PAPER TRADE DATABASE
+# =====================================================
+
+def open_paper_trade(token: TokenState, snapshot: Dict[str, Any]):
+    token.paper_entered = True
+    token.is_candidate = True
+    token.entry_snapshot = snapshot
+    token.entry_market_cap_sol = snapshot["current_market_cap_sol"]
+    token.entry_market_cap_usd = snapshot["current_market_cap_usd"]
+    token.entry_time = now_dt()
+
+    token.best_market_cap_usd = token.entry_market_cap_usd
+    token.best_return_percent = 0.0
+    token.best_return_seconds = ENTRY_SECONDS
+
+    token.worst_market_cap_usd = token.entry_market_cap_usd
+    token.worst_return_percent = 0.0
+    token.worst_return_seconds = ENTRY_SECONDS
+
+    cursor.execute("""
+    INSERT INTO pump_paper_trade_results (
+        run_id, mint, token_name, symbol, creator_wallet,
+        launch_time, entry_time, entry_seconds,
+        investment_eur, entry_market_cap_sol, entry_market_cap_usd,
+        trade_status, close_reason,
+
+        entry_buy_count, entry_sell_count, entry_unique_buyers, entry_unique_sellers,
+        entry_buy_volume_sol, entry_sell_volume_sol, entry_net_volume_sol,
+        entry_creator_sold, entry_creator_sell_volume_sol,
+        entry_top_buyer_share_percent, entry_risk_note,
+
+        best_market_cap_usd, best_return_percent, best_return_seconds,
+        worst_market_cap_usd, worst_return_percent, worst_return_seconds,
+        confirmed_move, first_confirmation_seconds
+    )
+    VALUES (
+        %s, %s, %s, %s, %s,
+        %s, %s, %s,
+        %s, %s, %s,
+        'OPEN', 'OPEN',
+
+        %s, %s, %s, %s,
+        %s, %s, %s,
+        %s, %s,
+        %s, %s,
+
+        %s, %s, %s,
+        %s, %s, %s,
+        %s, %s
+    )
+    ON DUPLICATE KEY UPDATE
+        trade_status = 'OPEN',
+        close_reason = 'OPEN',
+        entry_time = VALUES(entry_time),
+        entry_market_cap_sol = VALUES(entry_market_cap_sol),
+        entry_market_cap_usd = VALUES(entry_market_cap_usd)
+    """, (
+        RUN_ID, token.mint, token.name, token.symbol, token.creator_wallet,
+        token.launch_time, token.entry_time, ENTRY_SECONDS,
+        PAPER_INVESTMENT_EUR, token.entry_market_cap_sol, token.entry_market_cap_usd,
+
+        snapshot["buy_count"], snapshot["sell_count"],
+        snapshot["unique_buyers"], snapshot["unique_sellers"],
+        snapshot["buy_volume_sol"], snapshot["sell_volume_sol"], snapshot["net_volume_sol"],
+        snapshot["creator_sold"], snapshot["creator_sell_volume_sol"],
+        snapshot["top_buyer_share_percent"], snapshot["risk_notes"],
+
+        token.best_market_cap_usd, token.best_return_percent, token.best_return_seconds,
+        token.worst_market_cap_usd, token.worst_return_percent, token.worst_return_seconds,
+        token.confirmed_move, token.first_confirmation_seconds
+    ))
+    mydb.commit()
+
+    print()
+    print("PAPER BUY:", token.name, "|", token.symbol, "| mint:", token.mint)
+    print("Entry MC USD:", round(token.entry_market_cap_usd or 0, 2))
+    print("Investment EUR:", PAPER_INVESTMENT_EUR)
+    print("Risk notes:", snapshot["risk_notes"])
+    print()
+
+
+def update_open_trade_metrics(token: TokenState, snapshot: Dict[str, Any], window_seconds: int):
+    if not token.paper_entered or token.paper_closed:
+        return
+
+    current_mc_sol = snapshot["current_market_cap_sol"]
+    current_mc_usd = snapshot["current_market_cap_usd"]
+    ret = calc_return_percent(current_mc_sol, token.entry_market_cap_sol)
+
+    if ret is None or current_mc_usd is None:
+        return
+
+    if token.best_return_percent is None or ret > token.best_return_percent:
+        token.best_return_percent = ret
+        token.best_market_cap_usd = current_mc_usd
+        token.best_return_seconds = window_seconds
+
+    if token.worst_return_percent is None or ret < token.worst_return_percent:
+        token.worst_return_percent = ret
+        token.worst_market_cap_usd = current_mc_usd
+        token.worst_return_seconds = window_seconds
+
+    if ret >= 15:
+        token.hit_plus_15 = True
+    if ret >= 20:
+        token.hit_plus_20 = True
+    if ret >= 30:
+        token.hit_plus_30 = True
+
+    if (
+        CONFIRMATION_START_SECONDS <= window_seconds <= CONFIRMATION_END_SECONDS
+        and not token.confirmed_move
+        and ret >= MIN_CONFIRMATION_RETURN_PERCENT
+    ):
+        token.confirmed_move = True
+        token.first_confirmation_seconds = window_seconds
+        print("CONFIRMED MOVE:", token.mint, "|", seconds_label(window_seconds), "| return:", round(ret, 2), "%")
+
+    cursor.execute("""
+    UPDATE pump_paper_trade_results
+    SET
+        best_market_cap_usd = %s,
+        best_return_percent = %s,
+        best_return_seconds = %s,
+        worst_market_cap_usd = %s,
+        worst_return_percent = %s,
+        worst_return_seconds = %s,
+        hit_plus_15 = %s,
+        hit_plus_20 = %s,
+        hit_plus_30 = %s,
+        confirmed_move = %s,
+        first_confirmation_seconds = %s
+    WHERE run_id = %s AND mint = %s
+    """, (
+        token.best_market_cap_usd, token.best_return_percent, token.best_return_seconds,
+        token.worst_market_cap_usd, token.worst_return_percent, token.worst_return_seconds,
+        token.hit_plus_15, token.hit_plus_20, token.hit_plus_30,
+        token.confirmed_move, token.first_confirmation_seconds,
+        RUN_ID, token.mint
+    ))
+    mydb.commit()
+
+
+def close_paper_trade(token: TokenState, snapshot: Dict[str, Any], window_seconds: int, reason: str):
+    if token.paper_closed:
+        return
+
+    current_mc_sol = snapshot["current_market_cap_sol"]
+    current_mc_usd = snapshot["current_market_cap_usd"]
+    ret = calc_return_percent(current_mc_sol, token.entry_market_cap_sol)
+
+    if ret is None:
+        ret = 0.0
+
+    profit_eur = profit_from_return(ret)
+
+    token.paper_closed = True
+
+    cursor.execute("""
+    UPDATE pump_paper_trade_results
+    SET
+        close_time = %s,
+        close_seconds = %s,
+        close_market_cap_sol = %s,
+        close_market_cap_usd = %s,
+        return_percent = %s,
+        profit_eur = %s,
+        close_reason = %s,
+        trade_status = 'CLOSED',
+        best_market_cap_usd = %s,
+        best_return_percent = %s,
+        best_return_seconds = %s,
+        worst_market_cap_usd = %s,
+        worst_return_percent = %s,
+        worst_return_seconds = %s,
+        hit_plus_15 = %s,
+        hit_plus_20 = %s,
+        hit_plus_30 = %s,
+        confirmed_move = %s,
+        first_confirmation_seconds = %s
+    WHERE run_id = %s AND mint = %s
+    """, (
+        now_dt(), window_seconds, current_mc_sol, current_mc_usd,
+        ret, profit_eur, reason,
+        token.best_market_cap_usd, token.best_return_percent, token.best_return_seconds,
+        token.worst_market_cap_usd, token.worst_return_percent, token.worst_return_seconds,
+        token.hit_plus_15, token.hit_plus_20, token.hit_plus_30,
+        token.confirmed_move, token.first_confirmation_seconds,
+        RUN_ID, token.mint
+    ))
+    mydb.commit()
+
+    print()
+    print("PAPER SELL:", token.name, "|", token.symbol, "| mint:", token.mint)
+    print("Close reason:", reason)
+    print("Close time:", seconds_label(window_seconds))
+    print("Return:", round(ret, 2), "%")
+    print("Profit EUR:", round(profit_eur, 4))
+    print()
+
+
+# =====================================================
+# DECISION LOGIC
+# =====================================================
+
+def should_close_trade(token: TokenState, snapshot: Dict[str, Any], window_seconds: int) -> Optional[str]:
+    if not token.paper_entered or token.paper_closed:
+        return None
+
+    ret = calc_return_percent(snapshot["current_market_cap_sol"], token.entry_market_cap_sol)
+
+    if ret is None:
+        return None
+
+    # Take profit first.
+    if ret >= TAKE_PROFIT_PERCENT:
+        return f"TAKE_PROFIT_{TAKE_PROFIT_PERCENT:.0f}%"
+
+    # Stop loss.
+    if ret <= STOP_LOSS_PERCENT:
+        return f"STOP_LOSS_{abs(STOP_LOSS_PERCENT):.0f}%"
+
+    # No confirmation by 6:30.
+    if window_seconds >= CONFIRMATION_END_SECONDS and not token.confirmed_move:
+        return "NO_CONFIRMATION_BY_6_30"
+
+    # Force exit at 10:00.
+    if window_seconds >= FORCE_EXIT_SECONDS:
+        return "FORCE_EXIT_10M"
+
+    return None
+
+
+# =====================================================
+# ASYNC TASKS
+# =====================================================
+
+async def token_scheduler(
+    websocket,
+    token: TokenState,
+    tracked: Dict[str, TokenState],
+    active_mints: Set[str],
+    closed_trade_mints: Set[str],
+):
+    previous = 0
+
+    for window in DECISION_WINDOWS:
+        await asyncio.sleep(max(0, window - previous))
+
+        snapshot = calculate_snapshot(token, window)
+
+        if window == ENTRY_SECONDS:
+            if passes_entry_filters(snapshot) and len(closed_trade_mints) + count_open_trades(tracked) < MAX_PAPER_TRADES:
+                open_paper_trade(token, snapshot)
+            else:
+                await unsubscribe_token(websocket, token.mint)
+                active_mints.discard(token.mint)
+                tracked.pop(token.mint, None)
+
+                mc_usd = snapshot["current_market_cap_usd"] or 0
+                print("Rejected at 5m:", token.mint, "| MC USD:", round(mc_usd, 2), "| notes:", snapshot["risk_notes"])
+                return
+
+        elif window > ENTRY_SECONDS and token.paper_entered:
+            update_open_trade_metrics(token, snapshot, window)
+            close_reason = should_close_trade(token, snapshot, window)
+
+            if close_reason:
+                close_paper_trade(token, snapshot, window, close_reason)
+                closed_trade_mints.add(token.mint)
+
+                await unsubscribe_token(websocket, token.mint)
+                active_mints.discard(token.mint)
+                tracked.pop(token.mint, None)
+                return
+
+        previous = window
+
+    if token.paper_entered and not token.paper_closed:
+        final_snapshot = calculate_snapshot(token, FORCE_EXIT_SECONDS)
+        close_paper_trade(token, final_snapshot, FORCE_EXIT_SECONDS, "FORCE_EXIT_10M_END")
+        closed_trade_mints.add(token.mint)
+
+    await unsubscribe_token(websocket, token.mint)
+    active_mints.discard(token.mint)
+    tracked.pop(token.mint, None)
+
+
+def count_open_trades(tracked: Dict[str, TokenState]) -> int:
+    return sum(1 for t in tracked.values() if t.paper_entered and not t.paper_closed)
+
+
+async def unsubscribe_token(websocket, mint: str):
+    try:
+        await websocket.send(json.dumps({"method": "unsubscribeTokenTrade", "keys": [mint]}))
+    except Exception as e:
+        print("Unsubscribe error:", mint, e)
+
+
+# =====================================================
+# SUMMARY
+# =====================================================
+
+def print_summary():
+    cursor.execute("""
+    SELECT
+        COUNT(*) AS total_trades,
+        SUM(CASE WHEN return_percent > 0 THEN 1 ELSE 0 END) AS profitable_trades,
+        SUM(CASE WHEN close_reason LIKE 'TAKE_PROFIT%%' THEN 1 ELSE 0 END) AS take_profit_trades,
+        SUM(CASE WHEN close_reason LIKE 'STOP_LOSS%%' THEN 1 ELSE 0 END) AS stop_loss_trades,
+        SUM(profit_eur) AS total_profit_eur,
+        AVG(return_percent) AS avg_return_percent,
+        AVG(best_return_percent) AS avg_best_return_percent
+    FROM pump_paper_trade_results
+    WHERE run_id = %s
+      AND trade_status = 'CLOSED'
+    """, (RUN_ID,))
+    row = cursor.fetchone()
+
+    total = int(row["total_trades"] or 0)
+    profitable = int(row["profitable_trades"] or 0)
+    take_profit = int(row["take_profit_trades"] or 0)
+    stop_loss = int(row["stop_loss_trades"] or 0)
+    total_profit = float(row["total_profit_eur"] or 0)
+    avg_return = float(row["avg_return_percent"] or 0)
+    avg_best = float(row["avg_best_return_percent"] or 0)
+
+    success_rate_profitable = (profitable / total * 100) if total else 0
+    success_rate_take_profit = (take_profit / total * 100) if total else 0
+
+    print("\n" + "=" * 70)
+    print("PAPER TRADE SUMMARY")
+    print("=" * 70)
+    print("Run ID:", RUN_ID)
+    print("Total closed trades:", total)
+    print("Profitable trades:", profitable)
+    print("Take-profit trades:", take_profit)
+    print("Stop-loss trades:", stop_loss)
+    print("Success rate profitable:", round(success_rate_profitable, 2), "%")
+    print("Success rate take-profit:", round(success_rate_take_profit, 2), "%")
+    print("Total paper profit EUR:", round(total_profit, 4))
+    print("Average close return:", round(avg_return, 2), "%")
+    print("Average best return before close:", round(avg_best, 2), "%")
+
+    cursor.execute("""
+    SELECT
+        token_name,
+        symbol,
+        mint,
+        entry_market_cap_usd,
+        close_market_cap_usd,
+        return_percent,
+        profit_eur,
+        close_reason,
+        best_return_percent,
+        best_return_seconds,
+        confirmed_move,
+        entry_creator_sold,
+        entry_top_buyer_share_percent,
+        entry_net_volume_sol
+    FROM pump_paper_trade_results
+    WHERE run_id = %s
+    ORDER BY id
+    """, (RUN_ID,))
+    trades = cursor.fetchall()
+
+    print("\nTrades:")
+    for t in trades:
+        print(
+            f"- {t['token_name']} ({t['symbol']}) | "
+            f"Return: {round(float(t['return_percent'] or 0), 2)}% | "
+            f"Profit EUR: {round(float(t['profit_eur'] or 0), 4)} | "
+            f"Reason: {t['close_reason']} | "
+            f"Best: {round(float(t['best_return_percent'] or 0), 2)}% at {seconds_label(int(t['best_return_seconds'] or 0))}"
+        )
+
+
+# =====================================================
+# MAIN LOOP
+# =====================================================
+
+async def run_paper_bot():
+    ensure_tables()
+
+    if not PUMPPORTAL_API_KEY or PUMPPORTAL_API_KEY.startswith("PUT_"):
+        raise Exception("Add your real PumpPortal API key before running.")
+
+    print("Paper bot started.")
+    print("Run ID:", RUN_ID)
+    print("Strategy: $10k at 5m -> confirm 5:15-6:30 -> TP +15% / SL -15%")
+    print("Max paper trades:", MAX_PAPER_TRADES)
+    print("Paper investment per trade:", PAPER_INVESTMENT_EUR, "EUR")
+
+    tracked: Dict[str, TokenState] = {}
+    active_mints: Set[str] = set()
+    closed_trade_mints: Set[str] = set()
+
+    total_launches = 0
+    total_tracked = 0
+    paid_trade_messages = 0
+
+    loop = asyncio.get_running_loop()
+    start = loop.time()
+    launch_end = start + LAUNCH_COLLECTION_SECONDS
+
+    async with websockets.connect(PUMPPORTAL_URL, ping_interval=20, ping_timeout=20) as websocket:
+        print("Connected to PumpPortal WebSocket.")
+
+        await websocket.send(json.dumps({"method": "subscribeNewToken"}))
+        await websocket.send(json.dumps({"method": "subscribeMigration"}))
+
+        while True:
+            now_loop = loop.time()
+            launch_window_open = now_loop < launch_end
+
+            # Stop after 5 trades are closed.
+            if len(closed_trade_mints) >= MAX_PAPER_TRADES:
+                print("Max paper trades closed. Bot will stop.")
+                break
+
+            # Stop when launch window ended and no active tokens are left.
+            if not launch_window_open and len(active_mints) == 0:
+                print("Launch window closed and no active mints left.")
+                break
+
+            try:
+                raw = await asyncio.wait_for(websocket.recv(), timeout=5)
+                data = json.loads(raw)
+            except asyncio.TimeoutError:
+                continue
+            except Exception as e:
+                print("WebSocket receive error:", e)
+                continue
+
+            if data.get("message"):
+                print("Info:", data.get("message"))
+                continue
+
+            tx_type = data.get("txType")
+            mint = data.get("mint")
+
+            if not mint:
+                continue
+
+            if tx_type == "create":
+                if not launch_window_open:
+                    continue
+
+                total_launches += 1
+
+                if total_tracked >= MAX_TOTAL_TRACKED_TOKENS:
+                    continue
+
+                if len(active_mints) >= MAX_ACTIVE_TRACKED_TOKENS:
+                    continue
+
+                creator = data.get("traderPublicKey")
+
+                token = TokenState(
+                    mint=mint,
+                    name=clean_text(data.get("name")),
+                    symbol=clean_text(data.get("symbol")),
+                    creator_wallet=creator,
+                    launch_time=now_dt(),
+                    launch_ts=time.time(),
+                    initial_market_cap_sol=to_float(data.get("marketCapSol")),
+                )
+
+                tracked[mint] = token
+                active_mints.add(mint)
+                total_tracked += 1
+
+                await websocket.send(json.dumps({"method": "subscribeTokenTrade", "keys": [mint]}))
+
+                asyncio.create_task(token_scheduler(
+                    websocket,
+                    token,
+                    tracked,
+                    active_mints,
+                    closed_trade_mints
+                ))
+
+                print("Tracking:", token.name, "|", token.symbol, "|", mint, "| active:", len(active_mints))
+
+            elif tx_type in ["buy", "sell"]:
+                token = tracked.get(mint)
+                if not token:
+                    continue
+
+                paid_trade_messages += 1
+
+                seconds_after_launch = time.time() - token.launch_ts
+
+                token.trades.append(TradeEvent(
+                    tx_type=tx_type,
+                    trader=data.get("traderPublicKey"),
+                    sol_amount=float(to_float(data.get("solAmount")) or 0),
+                    market_cap_sol=to_float(data.get("marketCapSol")),
+                    seconds_after_launch=seconds_after_launch,
+                    signature=data.get("signature"),
+                ))
+
+                if paid_trade_messages % 500 == 0:
+                    est_sol = paid_trade_messages * 0.000001
+                    print(
+                        "Paid messages:", paid_trade_messages,
+                        "| estimated SOL:", round(est_sol, 6),
+                        "| active:", len(active_mints),
+                        "| closed paper trades:", len(closed_trade_mints)
+                    )
+
+            else:
+                # Migration events are not traded here, but can be logged if needed.
+                pass
+
+    print("\nRun finished.")
+    print("Total launches seen:", total_launches)
+    print("Total tracked:", total_tracked)
+    print("Paid trade messages:", paid_trade_messages)
+    print("Estimated SOL used:", round(paid_trade_messages * 0.000001, 6))
+
+    print_summary()
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(run_paper_bot())
+    finally:
+        try:
+            cursor.close()
+            mydb.close()
+        except Exception:
+            pass
